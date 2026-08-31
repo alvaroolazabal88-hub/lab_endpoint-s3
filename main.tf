@@ -104,11 +104,15 @@ data "aws_ami" "amazon_linux_2023" {
 resource "aws_security_group" "bastion_sg" {
   name   = "bastion-sg"
   vpc_id = aws_vpc.main.id
+
+  # The bastion is the only door into the private tier, so SSH is limited to
+  # the operator workstation. It is never open to 0.0.0.0/0.
   ingress {
+    description = "SSH from operator workstation"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.admin_cidr]
   }
   egress {
     from_port   = 0
@@ -139,7 +143,7 @@ resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.amazon_linux_2023.id
   instance_type               = "t3.micro"
   subnet_id                   = aws_subnet.public[0].id
-  key_name                    = "Macbook_Air_Key"
+  key_name                    = var.key_name
   vpc_security_group_ids      = [aws_security_group.bastion_sg.id]
   associate_public_ip_address = true # <--- IP PÚBLICA FORZADA
   tags                        = { Name = "bastion-host" }
@@ -149,7 +153,7 @@ resource "aws_instance" "private_host" {
   ami                    = data.aws_ami.amazon_linux_2023.id
   instance_type          = "t3.micro"
   subnet_id              = aws_subnet.private[0].id
-  key_name               = "Macbook_Air_Key"
+  key_name               = var.key_name
   vpc_security_group_ids = [aws_security_group.private_sg.id]
   tags                   = { Name = "private-test-host" }
 }
@@ -160,4 +164,15 @@ output "bastion_public_ip" {
 }
 output "private_instance_ip" {
   value = aws_instance.private_host.private_ip
+}
+
+# --- 12. VARIABLES ---
+variable "admin_cidr" {
+  description = "Your workstation public IP in CIDR form, e.g. 203.0.113.4/32"
+  type        = string
+}
+
+variable "key_name" {
+  description = "Name of an existing EC2 key pair in your account"
+  type        = string
 }
