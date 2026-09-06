@@ -1,22 +1,23 @@
-# --- 0. PROVIDER CONFIGURATION ---
-# Esto le dice a Terraform exactamente dónde trabajar
+# Region is pinned here, not inherited from the CLI default. Key pairs are
+# per-region and the state file remembers which region it built in; see
+# troubleshooting.md sections 1 and 3.
 provider "aws" {
   region = "us-east-1"
 }
 
-# 1. Disponibilidad de Zonas
+# Availability zones
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# 2. VPC Principal
+# VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   tags                 = { Name = "production-vpc" }
 }
 
-# 3. Subredes Públicas (Multi-AZ)
+# Public subnets, one per AZ
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
@@ -26,7 +27,7 @@ resource "aws_subnet" "public" {
   tags                    = { Name = "public-subnet-${count.index}" }
 }
 
-# 4. Subredes Privadas (Multi-AZ)
+# Private subnets, one per AZ
 resource "aws_subnet" "private" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -35,12 +36,15 @@ resource "aws_subnet" "private" {
   tags              = { Name = "private-subnet-${count.index}" }
 }
 
-# 5. Puerta de Enlace a Internet (IGW)
+# Internet gateway
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 }
 
-# 6. NAT Gateway
+# One NAT Gateway, in one AZ, shared by both private subnets through a single
+# private route table. If this AZ fails, both private subnets lose outbound.
+# Production wants one per AZ with a route table each; that roughly doubles the
+# NAT bill, and this is a lab.
 resource "aws_eip" "nat" { domain = "vpc" }
 
 resource "aws_nat_gateway" "main" {
@@ -49,7 +53,7 @@ resource "aws_nat_gateway" "main" {
   depends_on    = [aws_internet_gateway.igw]
 }
 
-# 7. Tablas de Rutas
+# Route tables
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
@@ -68,7 +72,7 @@ resource "aws_route_table" "private" {
   tags = { Name = "private-rt" }
 }
 
-# 8. Asociaciones
+# Route table associations
 resource "aws_route_table_association" "public" {
   count          = 2
   subnet_id      = aws_subnet.public[count.index].id
@@ -81,7 +85,9 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# 9. S3 Gateway Endpoint
+# The point of this stack. Attaching the endpoint to the private route table
+# puts S3-bound traffic on the AWS backbone instead of through the NAT, which
+# removes the NAT per-GB processing charge for it. No instance config changes.
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main.id
   service_name      = "com.amazonaws.us-east-1.s3"
@@ -90,7 +96,7 @@ resource "aws_vpc_endpoint" "s3" {
   tags              = { Name = "s3-endpoint-private" }
 }
 
-# --- 10. COMPUTE LAYER (BASTION & PRIVATE HOST) ---
+# Compute: bastion plus one private host, to prove the paths work
 
 data "aws_ami" "amazon_linux_2023" {
   most_recent = true
@@ -145,7 +151,7 @@ resource "aws_instance" "bastion" {
   subnet_id                   = aws_subnet.public[0].id
   key_name                    = var.key_name
   vpc_security_group_ids      = [aws_security_group.bastion_sg.id]
-  associate_public_ip_address = true # <--- IP PÚBLICA FORZADA
+  associate_public_ip_address = true # subnet default is not enough; see troubleshooting.md 4
   tags                        = { Name = "bastion-host" }
 }
 
@@ -158,7 +164,7 @@ resource "aws_instance" "private_host" {
   tags                   = { Name = "private-test-host" }
 }
 
-# --- 11. OUTPUTS ---
+# Outputs
 output "bastion_public_ip" {
   value = aws_instance.bastion.public_ip
 }
@@ -166,7 +172,7 @@ output "private_instance_ip" {
   value = aws_instance.private_host.private_ip
 }
 
-# --- 12. VARIABLES ---
+# Variables
 variable "admin_cidr" {
   description = "Your workstation public IP in CIDR form, e.g. 203.0.113.4/32"
   type        = string

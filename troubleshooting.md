@@ -1,82 +1,117 @@
-Markdown
-# 🛠️ AWS Enterprise Architecture Lab: Troubleshooting Guide
+# Troubleshooting log
 
-This document records the common errors encountered during the deployment of a Multi-AZ VPC architecture with a Bastion Host, NAT Gateway, and VPC Endpoints using Terraform. It serves as a reference for resolving state mismatches, IAM/SSH issues, and provider misconfigurations.
+Five failures I hit deploying this stack, in the order I hit them. Each one has
+the error as it appeared, what was actually wrong, and what fixed it. They are
+here because the errors are not the interesting part — the gap between what the
+message says and what is actually broken is.
 
----
+## 1. Key pair not found
 
-## 1. Key Pair Not Found Error
-**Error Message:**
-> `Error: creating EC2 Instance: operation error EC2: RunInstances, api error InvalidKeyPair.NotFound: The key pair 'Macbook_Air_Key' does not exist`
+```
+Error: creating EC2 Instance: operation error EC2: RunInstances,
+api error InvalidKeyPair.NotFound: The key pair 'Macbook_Air_Key' does not exist
+```
 
-**Root Cause:**
-AWS Key Pairs are region-specific. The AWS CLI or Terraform provider was defaulting to a different region (e.g., `us-west-2`) than where the Key Pair was physically created in the AWS Management Console (e.g., `us-east-1`).
+**Cause.** Key pairs are per-region. I had created the pair in `us-east-1` from
+the console, but the provider had no `region` set, so Terraform fell back to the
+CLI's default region and looked for the key there.
 
-**Solution:**
-Explicitly define the AWS Provider and the target region at the top of the `main.tf` file to ensure Terraform looks for resources in the correct location.
+**Fix.** Pin the region in the provider block instead of inheriting it from
+whatever the environment happens to be:
+
 ```hcl
 provider "aws" {
   region = "us-east-1"
 }
-2. S3 VPC Endpoint Type Mismatch
-Error Message:
+```
 
-api error InvalidParameter: Endpoint type (Gateway) does not match available service types ([Interface])
+Inheriting the region is the underlying mistake, and it comes back in section 3
+in a more expensive form.
 
-Root Cause:
-When defining a VPC Endpoint for S3 without explicitly specifying the vpc_endpoint_type, Terraform or the AWS API might attempt to create an "Interface" endpoint instead of a "Gateway" endpoint, resulting in a type mismatch.
+## 2. S3 endpoint type mismatch
 
-Solution:
-Explicitly declare the endpoint type as Gateway in the resource block.
+```
+api error InvalidParameter: Endpoint type (Gateway) does not match
+available service types ([Interface])
+```
 
-Terraform
+**Cause.** `vpc_endpoint_type` was not declared, so the endpoint defaulted to
+`Interface`. S3 supports both types and they are not interchangeable: the
+interface endpoint is an ENI with an hourly charge, the gateway endpoint is a
+route-table entry with no charge. The whole point of this lab is the second one.
+
+**Fix.** Declare the type explicitly.
+
+```hcl
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main.id
   service_name      = "com.amazonaws.us-east-1.s3"
-  vpc_endpoint_type = "Gateway" # <--- Added this line
+  vpc_endpoint_type = "Gateway"
   route_table_ids   = [aws_route_table.private.id]
 }
-3. The "Ghost VPC" (Terraform State Mismatch)
-Error Message:
+```
 
+## 3. The ghost VPC — state pointing at another region
+
+```
 api error InvalidVpcID.NotFound: The vpc ID 'vpc-074a0a66bbc190464' does not exist
+```
 
-Root Cause:
-An initial terraform apply was executed without a defined region, causing resources to be deployed in a default region (e.g., us-west-2). When the provider region was updated to us-east-1 in the code, the local terraform.tfstate file still contained the IDs of the resources located in the old region. Terraform tried to deploy subnets into a VPC ID that did not exist in the new region.
+**Cause.** The consequence of section 1. My first `terraform apply` ran without
+a declared region and built the VPC in `us-west-2`. When I then pinned the
+provider to `us-east-1`, the local `terraform.tfstate` still held the IDs of the
+`us-west-2` resources, so Terraform tried to create subnets inside a VPC that
+does not exist in the new region.
 
-Solution:
-Do not manually delete the state file, as this leaves "orphan" resources in AWS that generate costs (especially the NAT Gateway).
+**Fix, and the part that matters.** The tempting move is to delete the state
+file, because the error goes away. It goes away because Terraform has forgotten
+about the resources — not because they are gone. They stay running in
+`us-west-2` with nothing tracking them, and a NAT Gateway bills by the hour
+whether or not anyone remembers it exists.
 
-Revert the provider region in main.tf back to the incorrect region (us-west-2).
+So the state file is the thing to protect, not the thing to delete:
 
-Run terraform destroy -auto-approve to safely remove the mistakenly deployed infrastructure.
+1. Point the provider back at the wrong region, `us-west-2`.
+2. `terraform destroy` — the state still matches reality there, so this actually
+   removes the resources.
+3. Point the provider at `us-east-1`.
+4. `terraform apply`.
 
-Change the provider region back to the correct one (us-east-1).
+## 4. Bastion deployed but unreachable
 
-Run terraform apply -auto-approve.
+**Symptom.** The bastion came up and the apply succeeded, but
+`bastion_public_ip` came back empty, so there was nothing to SSH to.
 
-4. Bastion Host Unreachable (No Public IP)
-Issue:
-The Bastion Host is successfully deployed, but no Public IP is printed in the outputs, making SSH access impossible.
+**Cause.** `map_public_ip_on_launch = true` on the subnet is a default for
+instances launched in it, and it is not the only thing that decides the outcome.
 
-Root Cause:
-While the public subnet might have map_public_ip_on_launch = true, it is a best practice (and sometimes required depending on route configurations) to force the EC2 instance to associate a public IP upon creation.
+**Fix.** Set it on the instance, where it is not a default but an instruction:
 
-Solution:
-Add the associate_public_ip_address argument to the Bastion Host EC2 resource.
-
-Terraform
+```hcl
 resource "aws_instance" "bastion" {
-  # ... other config
+  # ...
   associate_public_ip_address = true
 }
-5. SSH Agent Forwarding: Permission Denied
-Error Message:
+```
 
-ec2-user@35.170.53.119: Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+## 5. Agent forwarding refused on the jump
 
-Root Cause:
-Attempting to connect to the Bastion Host (or jump to the private instance) using the -A (Agent Forwarding) flag, but the local machine's SSH agent does not have the private key loaded into its active memory.
+```
+ec2-user@<bastion-ip>: Permission denied (publickey,gssapi-keyex,gssapi-with-mic)
+```
 
-Solution (macOS):
-Load the private key into the Apple Keychain and the SSH agent before initiating the SSH connection.
+**Cause.** I was connecting with `ssh -A` to forward the agent through the
+bastion to the private host, but the key was not loaded into the local agent —
+having the file on disk is not the same as the agent holding it.
+
+**Fix, on macOS.** Load the key into the keychain and the agent before
+connecting:
+
+```bash
+ssh-add --apple-use-keychain ~/.ssh/your-key.pem
+ssh -A ec2-user@<bastion-public-ip>
+```
+
+Copying the private key onto the bastion also works and is the wrong answer: it
+puts the key that opens the private tier on the one host that is exposed to the
+internet.
