@@ -5,19 +5,16 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# Availability zones
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   tags                 = { Name = "production-vpc" }
 }
 
-# Public subnets, one per AZ
 resource "aws_subnet" "public" {
   count                   = 2
   vpc_id                  = aws_vpc.main.id
@@ -27,7 +24,6 @@ resource "aws_subnet" "public" {
   tags                    = { Name = "public-subnet-${count.index}" }
 }
 
-# Private subnets, one per AZ
 resource "aws_subnet" "private" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -36,7 +32,6 @@ resource "aws_subnet" "private" {
   tags              = { Name = "private-subnet-${count.index}" }
 }
 
-# Internet gateway
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.main.id
 }
@@ -53,7 +48,6 @@ resource "aws_nat_gateway" "main" {
   depends_on    = [aws_internet_gateway.igw]
 }
 
-# Route tables
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
@@ -72,7 +66,6 @@ resource "aws_route_table" "private" {
   tags = { Name = "private-rt" }
 }
 
-# Route table associations
 resource "aws_route_table_association" "public" {
   count          = 2
   subnet_id      = aws_subnet.public[count.index].id
@@ -164,7 +157,6 @@ resource "aws_instance" "private_host" {
   tags                   = { Name = "private-test-host" }
 }
 
-# Outputs
 output "bastion_public_ip" {
   value = aws_instance.bastion.public_ip
 }
@@ -172,7 +164,6 @@ output "private_instance_ip" {
   value = aws_instance.private_host.private_ip
 }
 
-# Variables
 variable "admin_cidr" {
   description = "Your workstation public IP in CIDR form, e.g. 203.0.113.4/32"
   type        = string
